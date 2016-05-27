@@ -8,6 +8,7 @@ using System.Data.SqlClient;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Linq;
 
 namespace IncentivoPagoDiario
 {
@@ -17,6 +18,8 @@ namespace IncentivoPagoDiario
         {
             Stopwatch relojGeneral = new Stopwatch();
             StringBuilder sbLog = new StringBuilder();
+            string cadenaConexion = ConfigurationManager.ConnectionStrings["con"].ConnectionString;
+            DateTime fechaProceso = DateTime.Today;
 
             sbLog.Append("Fecha Hora Procesamiento: ");
             sbLog.AppendLine(DateTime.Now.ToString());
@@ -27,9 +30,9 @@ namespace IncentivoPagoDiario
 
             //Obtener Archivo del Servidor
             List<string> rutaArchivos = new List<string>();
-            rutaArchivos.Add(@"E:\HTE - Edgar\Archivo de entrada\G20160516_01_9_309000.txt");
-            //List<string> rutaArchivos = TraerArchivosDeSftp();
-            
+            rutaArchivos.Add(@"C:\prueba\G20160516_01_9_309000.txt");
+            //List<string> rutaArchivos = TraerArchivosDeSftp(fechaProceso, sbLog);
+
             relojGeneral.Stop();
             sbLog.Append("Tiempo de traer archivos: ");
             sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
@@ -48,42 +51,63 @@ namespace IncentivoPagoDiario
                 sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
                 sbLog.AppendLine("");
 
+                if (lista == null || lista.Count == 0)
+                    continue;
 
+                SqlTransaction trx = null;
+                using (SqlConnection cnn = new SqlConnection(cadenaConexion))
+                {
+                    try
+                    {
+                        cnn.Open();
+                        trx = cnn.BeginTransaction();
 
-                sbLog.AppendLine("Insertar datos: ");
-                relojGeneral.Start();
+                        sbLog.AppendLine("Insertar datos: ");
+                        relojGeneral.Start();
 
-                //Insertar a tablas 
-                InsertarDatos(lista, 9);
+                        //Insertar a tablas 
+                        InsertarDatos(trx, cnn, fechaProceso, lista, sbLog);
 
-                relojGeneral.Stop();
-                sbLog.Append("Tiempo de insertar datos: ");
-                sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
-                sbLog.AppendLine("");
-
-
-
-                sbLog.AppendLine("Llamar sp validar: ");
-                relojGeneral.Start();
-
-                //Validacion de datos
-                LlamarSpValidar();
-
-                relojGeneral.Stop();
-                sbLog.Append("Tiempo de llamar sp validar: ");
-                sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
-                sbLog.AppendLine("");
+                        relojGeneral.Stop();
+                        sbLog.Append("Tiempo de insertar datos: ");
+                        sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
+                        sbLog.AppendLine("");
 
 
 
-                sbLog.AppendLine("Llamar sp cargar: ");
+                        sbLog.AppendLine("Llamar UspValidarPagoDiario: ");
+                        relojGeneral.Start();
+
+                        //Validacion de datos
+                        if (LlamarUspValidarPagoDiario(trx, cnn, fechaProceso, rutaArchivo, sbLog))
+                        {
+                            trx.Commit();
+                        }
+                        else
+                        {
+                            trx.Rollback();
+                        }
+
+
+                        relojGeneral.Stop();
+                        sbLog.Append("Tiempo de llamar UspValidarPagoDiario: ");
+                        sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
+                        sbLog.AppendLine("");
+                    }
+                    catch (Exception)
+                    {
+                        trx.Rollback();
+                    }
+                }
+
+                sbLog.AppendLine("Llamar a UspCargarPagaDiario: ");
                 relojGeneral.Start();
 
                 //Poblar modelo de datos
-                var listaProcesada = LlamarSpCargar();
+                var listaProcesada = LlamarUspCargarPagaDiario(fechaProceso, sbLog);
 
                 relojGeneral.Stop();
-                sbLog.Append("Tiempo de llamar sp cargar: ");
+                sbLog.Append("Tiempo de llamar a UspCargarPagaDiario: ");
                 sbLog.AppendLine(relojGeneral.Elapsed.TotalSeconds.ToString());
                 sbLog.AppendLine("");
 
@@ -93,7 +117,7 @@ namespace IncentivoPagoDiario
                 relojGeneral.Start();
 
                 //Generar archivo de ganadores 
-                GenerarArchivoGanadores(listaProcesada);
+                GenerarArchivoGanadores(listaProcesada, sbLog);
 
                 relojGeneral.Stop();
                 sbLog.Append("Tiempo de generar archivo ganadores: ");
@@ -102,14 +126,14 @@ namespace IncentivoPagoDiario
 
 
 
-                //Notificar por correo
-                NotificarPorCorreo("","");
             }
 
+            //Notificar por correo
+            NotificarPorCorreo("Incentivo Pago Diario " + fechaProceso.ToShortDateString(), sbLog.ToString());
 
         }
 
-        private static List<string> TraerArchivosDeSftp(StringBuilder log)
+        private static List<string> TraerArchivosDeSftp(DateTime fecha, StringBuilder log)
         {
             var listaArchivosObtenidos = new List<string>();
 
@@ -120,8 +144,7 @@ namespace IncentivoPagoDiario
                 string ftpClave = ConfigurationManager.AppSettings["ftpClave"];
                 string ftpRuta = ConfigurationManager.AppSettings["ftpRuta"];
 
-                string rutaDestino = ConfigurationManager.AppSettings["rutaDestino"];
-                DateTime fecha = DateTime.Now;
+                string rutaEntrada = ConfigurationManager.AppSettings["rutaEntrada"];
                 string nombreArchivoPatron = string.Format("G{0}", fecha.ToString("yyyyMMdd"));
 
 
@@ -137,15 +160,19 @@ namespace IncentivoPagoDiario
 
                     foreach (var file in files)
                     {
+                        Console.WriteLine(file.Name);
+
                         if (file.Name.StartsWith(nombreArchivoPatron))
                         {
-                            string nombreArchivo = string.Format("{0}\\{1}", rutaDestino, file.Name);
+                            string nombreArchivo = string.Format("{0}\\{1}", rutaEntrada, file.Name);
 
-                            using (FileStream fs = new FileStream(nombreArchivo, FileMode.Open))
+                            using (FileStream fs = new FileStream(nombreArchivo, FileMode.OpenOrCreate))
                             {
                                 client.DownloadFile(file.FullName, fs);
                                 listaArchivosObtenidos.Add(nombreArchivo);
                                 log.AppendLine("Archivo obtenido: " + nombreArchivo);
+                                Console.WriteLine("Archivo obtenido: " + nombreArchivo);
+
                             }
                         }
                     }
@@ -155,6 +182,9 @@ namespace IncentivoPagoDiario
             catch (Exception e)
             {
                 log.AppendLine("Error en TraerArchivosDeSftp");
+                Console.WriteLine(e.Message);                
+                Console.WriteLine(e.StackTrace);
+
             }
 
             return listaArchivosObtenidos;
@@ -164,6 +194,8 @@ namespace IncentivoPagoDiario
         private static List<PagoDiarioTdp> ValidarArchivo(string rutaArchivo, StringBuilder log) 
         {
             List<PagoDiarioTdp> listaPagoDiario = new List<PagoDiarioTdp>();
+            StringBuilder error = new StringBuilder();
+
             try
             {
                 int numeroLinea = 1,
@@ -174,7 +206,6 @@ namespace IncentivoPagoDiario
                     cabCodigoDistribuidor,
                     cabDescripcionIncentivo;
                 bool exito;
-                StringBuilder error = new StringBuilder();
                 DateTime cabFechaIncioIncentivo, cabFechaFinIncentivo;
                 decimal monto;
                 PagoDiarioTdp pagoDiario;
@@ -226,15 +257,15 @@ namespace IncentivoPagoDiario
                         if (!DateTime.TryParse(cabeceras[Constantes.INDICE_CABECERA_FECHA_INICIO_INCENTIVO],
                             out cabFechaIncioIncentivo))
                         {
-                            error.Append(string.Format(Constantes.MENSAJE_ERROR_CAMPO_FORMATO,
-                                Constantes.NOMBRE_CABECERA_FECHA_INICIO_INCENTIVO));
+                            //error.Append(string.Format(Constantes.MENSAJE_ERROR_CAMPO_FORMATO,
+                            //    Constantes.NOMBRE_CABECERA_FECHA_INICIO_INCENTIVO));
                         }
 
                         if (!DateTime.TryParse(cabeceras[Constantes.INDICE_CABECERA_FECHA_FIN_INCENTIVO],
                             out cabFechaFinIncentivo))
                         {
-                            error.Append(string.Format(Constantes.MENSAJE_ERROR_CAMPO_FORMATO,
-                                Constantes.NOMBRE_CABECERA_FECHA_FIN_INCENTIVO));
+                            //error.Append(string.Format(Constantes.MENSAJE_ERROR_CAMPO_FORMATO,
+                            //    Constantes.NOMBRE_CABECERA_FECHA_FIN_INCENTIVO));
                         }
 
                     }
@@ -312,98 +343,216 @@ namespace IncentivoPagoDiario
             {
                 log.AppendLine("Error en ValidarArchivo");
             }
+
+            if (error.Length > 0) 
+            {
+                string rutaError = ConfigurationManager.AppSettings["rutaErrores"];
+                if (Directory.Exists(rutaError))
+                {
+                    string archivoError = Path.Combine(rutaError, Path.GetFileNameWithoutExtension(rutaArchivo) + "_error.csv");
+                    log.AppendLine("Hubo un error de validación en archivo y se encuentra en la siguiente dirección: " + archivoError);
+                    log.AppendLine("");
+                    File.WriteAllText(archivoError, error.ToString());
+                }
+                return null;
+            }
+
             return listaPagoDiario;
         }
 
-        private static void InsertarDatos(List<PagoDiarioTdp> lista, int incentivoId) 
+        private static void InsertarDatos(SqlTransaction trx, SqlConnection cnn, 
+            DateTime fecha, List<PagoDiarioTdp> lista, StringBuilder log) 
         {
+            PagoDiarioTdp pagoDiarioTdp = lista.FirstOrDefault();
+
             var procesoPagoDiario = new ProcesoPagoDiario();
-            procesoPagoDiario.IncentivoId = incentivoId;
-            procesoPagoDiario.Fecha = DateTime.Today;
+            procesoPagoDiario.IncentivoId = pagoDiarioTdp.NumeroIncentivoTdp;
+            procesoPagoDiario.Fecha = fecha;
             procesoPagoDiario.FechaHoraCreacion = DateTime.Now;
 
-            string conexion = ConfigurationManager.ConnectionStrings["con"].ConnectionString;
-            using (SqlConnection con = new SqlConnection(conexion))
+
+            using (SqlCommand cmd = new SqlCommand()) 
             {
-                try
+                cmd.Transaction = trx;
+                cmd.Connection = cnn;
+                cmd.CommandText = "insert into ProcesoPagaDiario(Fecha, FechaHoraCreacion, IncentivoId) values (@Fecha, @FechaHoraCreacion, @IncentivoId); select SCOPE_IDENTITY();";
+                cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = procesoPagoDiario.Fecha;
+                cmd.Parameters.Add("@FechaHoraCreacion", SqlDbType.DateTime).Value = procesoPagoDiario.FechaHoraCreacion;
+                cmd.Parameters.Add("@IncentivoId", SqlDbType.Int).Value = procesoPagoDiario.IncentivoId;
+
+                procesoPagoDiario.ProcesoPagoDiarioId = Convert.ToInt32(cmd.ExecuteScalar());
+            }
+            lista.ForEach(x => x.ProcesoPagoDiarioId = procesoPagoDiario.ProcesoPagoDiarioId);
+            var tabla = ConvertirADataTable(lista);
+
+            using (SqlBulkCopy sbc = new SqlBulkCopy(cnn, SqlBulkCopyOptions.Default, trx))
+            {
+                sbc.BulkCopyTimeout = 200000;
+                sbc.DestinationTableName = "PagaDiarioTDP";
+                sbc.WriteToServer(tabla);
+
+                log.AppendLine("Registros insertados a tabla PagaDiarioTDP: " + tabla.Rows.Count);
+            }
+        }
+
+        private static bool LlamarUspValidarPagoDiario(SqlTransaction trx, SqlConnection cnn,
+            DateTime fechaProceso, string rutaArchivo, StringBuilder log) 
+        {
+            DataSet datasetValidaciones = new DataSet();
+            var tablaValidaciones = new DataTable();
+            int numeroErrores = 0;
+
+            using (SqlCommand cmd = new SqlCommand("uspValidarPagaDiario"))
+            {
+                cmd.Transaction = trx;
+                cmd.Connection = cnn;
+                cmd.CommandType = CommandType.StoredProcedure;
+                cmd.CommandTimeout = 200000;
+
+                SqlParameter par1 = cmd.Parameters.Add("@FechaProceso", SqlDbType.DateTime);
+                par1.Direction = ParameterDirection.Input;
+                par1.Value = fechaProceso;
+
+                using (SqlDataAdapter adapter = new SqlDataAdapter(cmd))
                 {
-                    con.Open();
-                    using (SqlCommand cmd = new SqlCommand()) 
+                    adapter.Fill(datasetValidaciones);
+                }
+
+
+                if (datasetValidaciones != null && datasetValidaciones.Tables.Count > 0)
+                {
+                    for (int i = 0; i < datasetValidaciones.Tables.Count; i++)
                     {
-                        cmd.Connection = con;
-                        cmd.CommandText = "insert into ProcesoPagaDiario(Fecha, FechaHoraCreacion, IncentivoId) values (@Fecha, @FechaHoraCreacion, @IncentivoId); select SCOPE_IDENTITY();";
-                        cmd.Parameters.Add("@Fecha", SqlDbType.DateTime).Value = procesoPagoDiario.Fecha;
-                        cmd.Parameters.Add("@FechaHoraCreacion", SqlDbType.DateTime).Value = procesoPagoDiario.FechaHoraCreacion;
-                        cmd.Parameters.Add("@IncentivoId", SqlDbType.Int).Value = procesoPagoDiario.IncentivoId;
+                        tablaValidaciones = datasetValidaciones.Tables[i];
 
-                        procesoPagoDiario.ProcesoPagoDiarioId = Convert.ToInt32(cmd.ExecuteScalar());
+                        if (tablaValidaciones != null && tablaValidaciones.Rows.Count > 0)
+                        {
+                            numeroErrores += tablaValidaciones.Rows.Count;
+                            string rutaError = ConfigurationManager.AppSettings["rutaErrores"];
+                            if (Directory.Exists(rutaError))
+                            {
+                                string archivoError = Path.Combine(rutaError, Path.GetFileNameWithoutExtension(rutaArchivo) + "_error.csv");
+                                log.AppendLine("Hubo un error de validación en archivo y se encuentra en la siguiente dirección: " + archivoError);
+                                log.AppendLine("");
+                                TablaATexto(tablaValidaciones, archivoError, ',');
+                            }
+                        }                        
                     }
-                    lista.ForEach(x => x.ProcesoPagoDiarioId = procesoPagoDiario.ProcesoPagoDiarioId);
-                    var tabla = ToDataTable(lista);
-                    Console.WriteLine("Insertando Tabla: ");
-                    using (SqlBulkCopy sbc = new SqlBulkCopy(con))
+                }
+
+            }
+
+            if (numeroErrores == 0)
+                return true;
+            else
+                return false;
+
+        }
+
+        private static beIncentivoPDVGanadorLista LlamarUspCargarPagaDiario(DateTime fecha, StringBuilder log)
+        {
+            string cadenaConexion = ConfigurationManager.ConnectionStrings["con"].ConnectionString;
+
+            using (SqlConnection con = new SqlConnection(cadenaConexion))
+            {
+                beIncentivoPDVGanadorLista obeIncentivoPDVGanadorLista = new beIncentivoPDVGanadorLista();
+                SqlCommand cmd = new SqlCommand("uspCargarPagaDiario", con);
+                cmd.CommandType = CommandType.StoredProcedure;
+
+                SqlParameter par1 = cmd.Parameters.Add("@FechaProceso", SqlDbType.DateTime);
+                par1.Direction = ParameterDirection.Input;
+                par1.Value = fecha;
+
+                con.Open();
+                SqlDataReader drd = cmd.ExecuteReader();
+                beIncentivoGanador obeIncentivoGanador = null;
+                List<beIncentivoPDVGanador> lbeIncentivoPDVGanador = null;
+
+                if (drd != null)
+                {
+                    if (drd.HasRows)
                     {
-                        sbc.BulkCopyTimeout = 200000;
-                        sbc.DestinationTableName = "PagaDiarioTDP";
-                        sbc.WriteToServer(tabla);
+                        drd.Read();
+                        int posIncentivoId = drd.GetOrdinal("IncentivoId");
+                        int posDescripcion = drd.GetOrdinal("Descripcion");
+                        int posFechaInicio = drd.GetOrdinal("FechaInicio");
+                        int posFechaFin = drd.GetOrdinal("FechaFin");
+                        obeIncentivoGanador = new beIncentivoGanador();
+                        obeIncentivoGanador.IncentivoId = drd.GetInt32(posIncentivoId);
+                        obeIncentivoGanador.Descripcion = drd.GetString(posDescripcion);
+                        obeIncentivoGanador.FechaInicio = drd.GetDateTime(posFechaInicio);
+                        obeIncentivoGanador.FechaFin = drd.GetDateTime(posFechaFin);
+                        if (drd.NextResult())
+                        {
+                            int posIncentId = drd.GetOrdinal("IncentivoId");
+                            int posDistribuidorId = drd.GetOrdinal("DistribuidorId");
+                            int posPuntoVentaId = drd.GetOrdinal("PuntoVentaId");
+                            int posNumeroCelular = drd.GetOrdinal("NumeroCelular");
+                            int posMontoIncentivo = drd.GetOrdinal("MontoIncentivo");
+                            lbeIncentivoPDVGanador = new List<beIncentivoPDVGanador>();
+                            beIncentivoPDVGanador obeIncentivoPDVGanador;
+                            while (drd.Read())
+                            {
+                                obeIncentivoPDVGanador = new beIncentivoPDVGanador();
+                                obeIncentivoPDVGanador.IncentivoId = drd.GetInt32(posIncentId);
+                                obeIncentivoPDVGanador.DistribuidorId = drd.GetString(posDistribuidorId);
+                                obeIncentivoPDVGanador.PuntoVentaId = drd.GetString(posPuntoVentaId);
+                                obeIncentivoPDVGanador.NumeroCelular = drd.GetString(posNumeroCelular);
+                                obeIncentivoPDVGanador.MontoIncentivo = drd.GetDecimal(posMontoIncentivo);
+                                lbeIncentivoPDVGanador.Add(obeIncentivoPDVGanador);
+                            }
+                        }
                     }
+                    drd.Close();
+                    obeIncentivoPDVGanadorLista.FechaCorrelativo = fecha.ToString("yyyyMMdd");
                 }
-                catch (Exception ex)
-                {
-                }
+                obeIncentivoPDVGanadorLista.IncentivoGanador = obeIncentivoGanador;
+                obeIncentivoPDVGanadorLista.ListaIncentivoGanador = lbeIncentivoPDVGanador;
+                log.AppendLine("Llamada a uspCargarPagaDiario, registros obtenidos: "+ lbeIncentivoPDVGanador.Count); 
+                return (obeIncentivoPDVGanadorLista);
             }
-        }
 
-        private static bool LlamarSpValidar() 
-        {
-            string conexion = ConfigurationManager.ConnectionStrings["con"].ConnectionString;
-            using (SqlConnection con = new SqlConnection(conexion)) 
-            {
-                using (SqlCommand cmd = new SqlCommand("SP_Validar"))
-                {
-                    cmd.Connection = con;
-                    cmd.CommandType = CommandType.StoredProcedure;
-
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            return true;
 
         }
 
-        private static List<PagoDiarioTdp> LlamarSpCargar()
+        private static void GenerarArchivoGanadores(beIncentivoPDVGanadorLista incentivoGanadorLista, StringBuilder log) 
         {
-            string conexion = ConfigurationManager.ConnectionStrings["con"].ConnectionString;
-            using (SqlConnection con = new SqlConnection(conexion))
-            {
-                using (SqlCommand cmd = new SqlCommand("SP_Cargar"))
-                {
-                    cmd.Connection = con;
-                    cmd.CommandType = CommandType.StoredProcedure;
+            if (incentivoGanadorLista == null || incentivoGanadorLista.IncentivoGanador == null || 
+                incentivoGanadorLista.ListaIncentivoGanador.Count == 0)
+                return;
 
-                    cmd.ExecuteNonQuery();
-                }
-            }
-            return null;
-
-        }
-
-        private static void GenerarArchivoGanadores(List<PagoDiarioTdp> lista) 
-        {
-            StringBuilder sb = new StringBuilder();
-            PagoDiarioTdp pagoDiario = null;
-            foreach (var item in lista)
-            {
-                sb.AppendLine(String.Format("{0},{1},{2},{3},{4:n2}", item.NumeroIncentivoTdp, item.DistribuidorTdp, item.CodigoPdvTdp, item.NumeroCelular, item.Monto));
-                pagoDiario = item;
-            }
-
-            var nombre = String.Format("G{0}_{1}_{2}.csv", "", pagoDiario.NumeroIncentivoTdp, pagoDiario.DistribuidorTdp);
-            var rutaSalida = ConfigurationManager.AppSettings["rutaSalida"];
-            var nombreArchivo = string.Format("{0}//{1}", nombre, rutaSalida);
-
-            File.WriteAllText(nombreArchivo, sb.ToString());
-
+			int x = 0;
+            string rutaSalida = ConfigurationManager.AppSettings["rutaSalida"];
+			beIncentivoPDVGanador obeIncentivoPDVGanador;
+            string idDistribuidor = incentivoGanadorLista.ListaIncentivoGanador[0].DistribuidorId.Substring(0, 3);
+			StringBuilder sb = new StringBuilder();
+            beIncentivoGanador obeIncentivoGanador = incentivoGanadorLista.IncentivoGanador;
+			sb.AppendLine(String.Format("{0},{1},{2},{3},{4}", idDistribuidor, obeIncentivoGanador.IncentivoId, obeIncentivoGanador.Descripcion, obeIncentivoGanador.FechaInicio, obeIncentivoGanador.FechaFin));
+			string nombre;
+			string archivo;
+			string nombreZip;
+			string archivoZip;
+            for (int i = 0; i < incentivoGanadorLista.ListaIncentivoGanador.Count; i++)
+			{
+                obeIncentivoPDVGanador = incentivoGanadorLista.ListaIncentivoGanador[i];
+				if (obeIncentivoPDVGanador.DistribuidorId.Substring(0, 3).Equals(idDistribuidor))
+				{
+					sb.AppendLine(String.Format("{0},{1},{2},{3},{4:n2}", obeIncentivoPDVGanador.IncentivoId, obeIncentivoPDVGanador.DistribuidorId, obeIncentivoPDVGanador.PuntoVentaId, obeIncentivoPDVGanador.NumeroCelular, obeIncentivoPDVGanador.MontoIncentivo));
+				}
+				//else
+                if (!obeIncentivoPDVGanador.DistribuidorId.Substring(0, 3).Equals(idDistribuidor) || (i == incentivoGanadorLista.ListaIncentivoGanador.Count - 1))
+				{
+                    nombre = String.Format("G{0}_{1}_{2}.csv", incentivoGanadorLista.FechaCorrelativo, obeIncentivoGanador.IncentivoId, idDistribuidor);
+					archivo = Path.Combine(rutaSalida, nombre);
+					File.WriteAllText(archivo, sb.ToString());
+                    log.AppendLine("Archivo generado " + archivo);
+					idDistribuidor = obeIncentivoPDVGanador.DistribuidorId.Substring(0, 3);
+					sb.Clear();
+					sb.AppendLine(String.Format("{0},{1},{2},{3},{4}", idDistribuidor, obeIncentivoGanador.IncentivoId, obeIncentivoGanador.Descripcion, obeIncentivoGanador.FechaInicio, obeIncentivoGanador.FechaFin));
+					sb.AppendLine(String.Format("{0},{1},{2},{3},{4:n2}", obeIncentivoPDVGanador.IncentivoId, obeIncentivoPDVGanador.DistribuidorId, obeIncentivoPDVGanador.PuntoVentaId, obeIncentivoPDVGanador.NumeroCelular, obeIncentivoPDVGanador.MontoIncentivo));
+					x++;
+				}
+			}
         }
 
         private static void NotificarPorCorreo(string titulo, string contenido) 
@@ -414,14 +563,13 @@ namespace IncentivoPagoDiario
             obeMensaje.Clave = ConfigurationManager.AppSettings["CorreoClave"].ToString();
             obeMensaje.Para = correos;
             obeMensaje.Asunto = titulo;
-            obeMensaje.Contenido = contenido;
+            obeMensaje.Contenido = "<br>" + contenido.Replace("\n", "</br><br>") + "</br>";
             Console.WriteLine("Enviando Email");
             ucCorreo.enviar(obeMensaje);
 
         }
-
         
-        private static DataTable ToDataTable<T>(IList<T> data)
+        private static DataTable ConvertirADataTable<T>(IList<T> data)
         {
             PropertyDescriptorCollection props =
                 TypeDescriptor.GetProperties(typeof(T));
@@ -443,6 +591,34 @@ namespace IncentivoPagoDiario
             return table;
         }
 
+        private static void TablaATexto(DataTable tabla, string archivo, char separador)
+        {
+            using (FileStream fs = new FileStream(archivo, FileMode.Append, FileAccess.Write, FileShare.Write))
+            {
+                using (StreamWriter sw = new StreamWriter(fs, Encoding.Default))
+                {
+                    for (int i = 0; i < tabla.Columns.Count; i++)
+                    {
+                        sw.Write((char)34);
+                        sw.Write(tabla.Columns[i].ColumnName);
+                        sw.Write((char)34);
+                        if (i < tabla.Columns.Count - 1) sw.Write(separador);
+                    }
+                    sw.WriteLine();
+                    for (int j = 0; j < tabla.Rows.Count; j++)
+                    {
+                        for (int i = 0; i < tabla.Columns.Count; i++)
+                        {
+                            sw.Write((char)34);
+                            sw.Write(tabla.Rows[j][i].ToString());
+                            sw.Write((char)34);
+                            if (i < tabla.Columns.Count - 1) sw.Write(separador);
+                        }
+                        sw.WriteLine();
+                    }
+                }
+            }
+        }
     }
 
     public class ProcesoPagoDiario 
@@ -465,4 +641,29 @@ namespace IncentivoPagoDiario
         public string Observacion { get; set; }
         public int ProcesoPagoDiarioId { get; set; }
     }
+
+    public class beIncentivoGanador
+    {
+        public int IncentivoId { get; set; }
+        public string Descripcion { get; set; }
+        public DateTime FechaInicio { get; set; }
+        public DateTime FechaFin { get; set; }
+    }
+
+    public class beIncentivoPDVGanador
+    {
+        public int IncentivoId { get; set; }
+        public string DistribuidorId { get; set; }
+        public string PuntoVentaId { get; set; }
+        public string NumeroCelular { get; set; }
+        public decimal MontoIncentivo { get; set; }
+    }
+
+    public class beIncentivoPDVGanadorLista
+    {
+        public beIncentivoGanador IncentivoGanador { get; set; }
+        public List<beIncentivoPDVGanador> ListaIncentivoGanador { get; set; }
+        public string FechaCorrelativo { get; set; }
+    }
+
 }
